@@ -46,3 +46,17 @@ class Gather(torch.autograd.Function):
                 
         chunks = split_tensor_along_last_dim(grad_output, pgm.process_group_manager.tp_world_size)
         return chunks[pgm.process_group_manager.tp_rank].contiguous()
+
+class Copy(torch.autograd.Function):
+    """Identity in forward pass, all-reduce in backward"""
+    @staticmethod
+    def forward(ctx, input):
+        return input
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        if pgm.process_group_manager.tp_world_size == 1:
+            return grad_output
+        
+        dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.tp_group)
+        return grad_output

@@ -2,7 +2,7 @@
 import torch
 import torch.distributed as dist
 import process_group_manager as pgm
-from tensor_parallel import split_tensor_along_last_dim, Reduce, Gather
+from tensor_parallel import split_tensor_along_last_dim, Reduce, Gather, Copy
 
 from unittest.mock import Mock
 
@@ -166,5 +166,65 @@ class TestGather:
         loss.backward()
         
         # Gradient should be 2 (from * 2 operation)
+        assert x.grad is not None
+        assert torch.allclose(x.grad, torch.full_like(x, 2.0))
+
+class TestCopy:
+    """Tests for Copy communication primitive"""
+    
+    def setup_method(self):
+        """Setup mock before each test"""
+        pgm.process_group_manager = Mock()
+        pgm.process_group_manager.tp_world_size = 1
+        pgm.process_group_manager.tp_rank = 0
+        pgm.process_group_manager.tp_group = None
+    
+    def test_forward_is_identity(self):
+        """Forward always returns input unchanged"""
+        x = torch.randn(2, 4, requires_grad=True)
+        y = Copy.apply(x)
+        
+        assert torch.equal(x, y)
+        assert y.requires_grad
+    
+    def test_backward_tp1_is_identity(self):
+        """When TP=1, backward is identity"""
+        x = torch.randn(2, 4, requires_grad=True)
+        y = Copy.apply(x)
+        loss = y.sum()
+        loss.backward()
+        
+        # Gradient should be ones (from sum)
+        assert x.grad is not None
+        assert torch.allclose(x.grad, torch.ones_like(x))
+    
+    def test_preserves_shape(self):
+        """Forward preserves tensor shape"""
+        x = torch.randn(3, 5, 7, requires_grad=True)
+        y = Copy.apply(x)
+        assert y.shape == x.shape
+    
+    def test_gradient_flow(self):
+        """Gradients flow correctly through Copy"""
+        x = torch.randn(2, 4, requires_grad=True)
+        y = Copy.apply(x)
+        z = y * 3  # Some operation after Copy
+        loss = z.sum()
+        loss.backward()
+        
+        # Gradient should be 3 (from * 3 operation)
+        assert x.grad is not None
+        assert torch.allclose(x.grad, torch.full_like(x, 3.0))
+    
+    def test_multiple_operations(self):
+        """Copy works in chain of operations"""
+        x = torch.randn(2, 3, requires_grad=True)
+        y = Copy.apply(x)
+        z = y + 5
+        w = z * 2
+        loss = w.sum()
+        loss.backward()
+        
+        # Gradient: d(loss)/d(x) = 2 (from chain rule)
         assert x.grad is not None
         assert torch.allclose(x.grad, torch.full_like(x, 2.0))
