@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 import process_group_manager as pgm
+import torch.nn as nn
 
 def split_tensor_along_last_dim(tensor, num_partitions):
     last_dim = tensor.dim() - 1
@@ -60,3 +61,23 @@ class Copy(torch.autograd.Function):
         
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.tp_group)
         return grad_output
+    
+class ColumnParallelLinear(nn.Modules):
+    def __init__(self, in_features: int, out_features: int, bias: bool, gather_output: bool = False):
+
+        super(ColumnParallelLinear, self).init()
+        self.tp_world_size = pgm.process_group_manager.tp_world_size
+        self.tp_rank = pgm.process_group_manager.tp_rank
+        self.apply_gather = gather_output
+
+        self.in_features = in_features
+        self.out_features = out_features
+        assert out_features % self.tp_world_size == 0
+        self.output_size_per_partitions = out_features // self.tp_world_size
+
+    def reset_parameters(self):
+        pass
+
+    def forward(self, input):
+        pass
+
