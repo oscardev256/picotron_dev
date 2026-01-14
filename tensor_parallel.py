@@ -2,6 +2,8 @@ import torch
 import torch.distributed as dist
 import process_group_manager as pgm
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 def split_tensor_along_last_dim(tensor, num_partitions):
     last_dim = tensor.dim() - 1
@@ -61,23 +63,65 @@ class Copy(torch.autograd.Function):
         
         dist.all_reduce(grad_output, op=dist.ReduceOp.SUM, group=pgm.process_group_manager.tp_group)
         return grad_output
-    
-class ColumnParallelLinear(nn.Modules):
+
+
+class ColumnParallelLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool, gather_output: bool = False):
 
-        super(ColumnParallelLinear, self).init()
+        super(ColumnParallelLinear, self).__init__()
         self.tp_world_size = pgm.process_group_manager.tp_world_size
         self.tp_rank = pgm.process_group_manager.tp_rank
-        self.apply_gather = gather_output
+        self.gather_output = gather_output
 
         self.in_features = in_features
         self.out_features = out_features
         assert out_features % self.tp_world_size == 0
-        self.output_size_per_partitions = out_features // self.tp_world_size
+        self.output_size_per_partition = out_features // self.tp_world_size
+
+        self.weight = nn.Parameter(torch.Tensor(self.output_size_per_partition, self.in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(self.output_size_per_partition))
+
+            # Initialize to zeros WITHOUT tracking gradients
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            # Explicitly register bias as None (no bias).
+            self.register_parameter("bias", None)
+        self.reset_parameters()
 
     def reset_parameters(self):
-        pass
+        # Initialize weight tensor with the default initializatin method used for F.linear in PyTorch
+        if self.tp_world_size == 1:
+            # U(-sqrt(k), sqrt(k))
+            k = 1 / self.weight.size(1)
+            bound = math.sqrt(k)
+            torch.nn.init.uniform_(self.weight, -bound, bound)
+            return
+
+        # When TP > 1, initialize master weight
+        master_weight = torch.empty(self.out_features, self.in_features, dtype=self.weight.dtype, requires_grad=False)
+
+        # Calculate bound based on the master weight's input dimension. U(-sqrt(k), sqrt(k))
+        k = 1 / self.weight.size(1)
+        bound = math.sqrt(k)
+        torch.nn.init.uniform_(master_weight, -bound, bound)
+
+        # Split model into size of self.output_size_per_partition and take corresponding partition
+        weight_list = torch.split(master_weight, self.output_size_per_partition, dim=0)      
+        self.weights.data = weight_list[self.tp_rank].contiguous()
+
 
     def forward(self, input):
-        pass
+        input_parallel = Copy.apply(input)
+
+        #XW_i^T + b, output is Y_i
+        output = F.linear(input_parallel, self.weight, self.bias)
+
+        if self.gather_output:
+            output = Gather.apply(output)
+
+        return output
+
+
 

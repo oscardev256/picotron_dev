@@ -2,7 +2,7 @@
 import torch
 import torch.distributed as dist
 import process_group_manager as pgm
-from tensor_parallel import split_tensor_along_last_dim, Reduce, Gather, Copy
+from tensor_parallel import split_tensor_along_last_dim, Reduce, Gather, Copy, ColumnParallelLinear
 
 from unittest.mock import Mock
 
@@ -228,3 +228,121 @@ class TestCopy:
         # Gradient: d(loss)/d(x) = 2 (from chain rule)
         assert x.grad is not None
         assert torch.allclose(x.grad, torch.full_like(x, 2.0))
+
+
+class TestColumnParallelLinear:
+    """Tests for ColumnParallelLinear"""
+    
+    def setup_method(self):
+        """Setup mock before each test"""
+        pgm.process_group_manager = Mock()
+        pgm.process_group_manager.tp_world_size = 1
+        pgm.process_group_manager.tp_rank = 0
+        pgm.process_group_manager.tp_group = None
+    
+    def test_init_shapes(self):
+        """Test weight and bias shapes are correct"""
+        layer = ColumnParallelLinear(
+            in_features=8, 
+            out_features=16, 
+            bias=True,
+            gather_output=False
+        )
+        
+        # TP=1, so output_size_per_partition = out_features
+        assert layer.weight.shape == (16, 8)
+        assert layer.bias.shape == (16,)
+    
+    def test_init_no_bias(self):
+        """Test layer without bias"""
+        layer = ColumnParallelLinear(
+            in_features=8, 
+            out_features=16, 
+            bias=False
+        )
+        
+        assert layer.bias is None
+        assert hasattr(layer, 'bias')  # Registered as None
+    
+    def test_forward_shape_no_gather(self):
+        """Forward preserves shape when not gathering"""
+        layer = ColumnParallelLinear(8, 16, bias=True, gather_output=False)
+        x = torch.randn(2, 8)
+        y = layer(x)
+        
+        assert y.shape == (2, 16)
+    
+    def test_forward_shape_with_gather(self):
+        """Forward preserves shape when gathering (TP=1)"""
+        layer = ColumnParallelLinear(8, 16, bias=True, gather_output=True)
+        x = torch.randn(2, 8)
+        y = layer(x)
+        
+        assert y.shape == (2, 16)
+    
+    def test_forward_with_bias(self):
+        """Forward applies bias correctly"""
+        layer = ColumnParallelLinear(4, 8, bias=True, gather_output=False)
+        x = torch.randn(2, 4)
+        y = layer(x)
+        
+        # Output should not be zero (weights are initialized)
+        assert not torch.allclose(y, torch.zeros_like(y))
+    
+    def test_gradient_flow(self):
+        """Gradients flow through layer"""
+        layer = ColumnParallelLinear(4, 8, bias=True, gather_output=False)
+        x = torch.randn(2, 4, requires_grad=True)
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+        
+        # Check gradients exist
+        assert x.grad is not None
+        assert layer.weight.grad is not None
+        assert layer.bias.grad is not None
+    
+    def test_bias_initialized_to_zero(self):
+        """Bias is initialized to zeros"""
+        layer = ColumnParallelLinear(4, 8, bias=True)
+        assert torch.allclose(layer.bias, torch.zeros_like(layer.bias))
+    
+    def test_weight_initialized(self):
+        """Weight is initialized (not zeros)"""
+        layer = ColumnParallelLinear(4, 8, bias=True)
+        # Should not be all zeros after initialization
+        assert not torch.allclose(layer.weight, torch.zeros_like(layer.weight))
+    
+    def test_output_size_per_partition(self):
+        """output_size_per_partition calculated correctly"""
+        layer = ColumnParallelLinear(8, 16, bias=True)
+        # TP=1, so should be full size
+        assert layer.output_size_per_partition == 16
+    
+    def test_gather_output_flag(self):
+        """gather_output flag stored correctly"""
+        layer1 = ColumnParallelLinear(8, 16, bias=True, gather_output=True)
+        layer2 = ColumnParallelLinear(8, 16, bias=True, gather_output=False)
+        
+        assert layer1.gather_output == True
+        assert layer2.gather_output == False
+    
+    def test_3d_input(self):
+        """Works with 3D input (batch, seq, features)"""
+        layer = ColumnParallelLinear(8, 16, bias=True)
+        x = torch.randn(2, 10, 8)  # batch=2, seq=10, features=8
+        y = layer(x)
+        
+        assert y.shape == (2, 10, 16)
+    
+    def test_multiple_forward_passes(self):
+        """Layer works for multiple forward passes"""
+        layer = ColumnParallelLinear(4, 8, bias=True)
+        x1 = torch.randn(2, 4)
+        x2 = torch.randn(3, 4)
+        
+        y1 = layer(x1)
+        y2 = layer(x2)
+        
+        assert y1.shape == (2, 8)
+        assert y2.shape == (3, 8)
