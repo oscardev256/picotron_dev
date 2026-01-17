@@ -113,15 +113,70 @@ class ColumnParallelLinear(nn.Module):
 
 
     def forward(self, input):
-        input_parallel = Copy.apply(input)
+        input_replicated = Copy.apply(input)
 
-        #XW_i^T + b, output is Y_i
-        output = F.linear(input_parallel, self.weight, self.bias)
+        # X @ W_i^T + b_i, output is Y_i
+        output_partitioned = F.linear(input_replicated, self.weight, self.bias)
 
         if self.gather_output:
-            output = Gather.apply(output)
+            output = Gather.apply(output_partitioned)
 
-        return output
+        return output if self.gather_output else output_partitioned
 
 
+class RowParallelLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool):
+
+        super(RowParallelLinear, self).__init__()
+        self.tp_world_size = pgm.process_group_manager.tp_world_size
+        self.tp_rank = pgm.process_group_manager.tp_rank
+
+        self.in_features = in_features
+        self.out_features = out_features
+        assert in_features % self.tp_world_size == 0
+        self.input_size_per_partition = in_features // self.tp_world_size
+
+        self.weight = nn.Parameter(torch.Tensor(self.out_features, self.input_size_per_partition))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(self.out_features))
+
+            # Initialize to zeros WITHOUT tracking gradients
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            # Explicitly register bias as None (no bias).
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Initialize weight tensor with the default initializatin method used for F.linear in PyTorch
+        if self.tp_world_size == 1:
+            # U(-sqrt(k), sqrt(k))
+            k = 1 / self.weight.size(1)
+            bound = math.sqrt(k)
+            torch.nn.init.uniform_(self.weight, -bound, bound)
+            return
+
+        # When TP > 1, initialize master weight
+        master_weight = torch.empty(self.out_features, self.in_features, dtype=self.weight.dtype, requires_grad=False)
+
+        # Calculate bound based on the master weight's input dimension. U(-sqrt(k), sqrt(k))
+        k = 1 / self.weight.size(1)
+        bound = math.sqrt(k)
+        torch.nn.init.uniform_(master_weight, -bound, bound)
+
+        # Split model into size of self.output_size_per_partition and take corresponding partition
+        weight_list = torch.split(master_weight, self.input_size_per_partition, dim=1)      
+        self.weights.data = weight_list[self.tp_rank].contiguous()
+
+
+    def forward(self, input_partitioned):
+
+        # X_i @ W_i^T + b
+        output_partial = F.linear(input_partitioned, self.weight, self.bias)
+
+        # All-reduce across all partitions
+        output = Reduce.apply(output_partial)
+
+        return output if self.bias is None else output + self.bias
 

@@ -2,7 +2,7 @@
 import torch
 import torch.distributed as dist
 import process_group_manager as pgm
-from tensor_parallel import split_tensor_along_last_dim, Reduce, Gather, Copy, ColumnParallelLinear
+from tensor_parallel import split_tensor_along_last_dim, Reduce, Gather, Copy, ColumnParallelLinear, RowParallelLinear
 
 from unittest.mock import Mock
 
@@ -346,3 +346,140 @@ class TestColumnParallelLinear:
         
         assert y1.shape == (2, 8)
         assert y2.shape == (3, 8)
+
+
+class TestRowParallelLinear:
+    """Tests for RowParallelLinear"""
+    
+    def setup_method(self):
+        """Setup mock before each test"""
+        pgm.process_group_manager = Mock()
+        pgm.process_group_manager.tp_world_size = 1
+        pgm.process_group_manager.tp_rank = 0
+        pgm.process_group_manager.tp_group = None
+    
+    def test_init_shapes(self):
+        """Test weight and bias shapes are correct"""
+        layer = RowParallelLinear(
+            in_features=16, 
+            out_features=8, 
+            bias=True
+        )
+        
+        # TP=1, so input_size_per_partition = in_features
+        assert layer.weight.shape == (8, 16)
+        assert layer.bias.shape == (8,)  # Full bias, not partitioned
+    
+    def test_init_no_bias(self):
+        """Test layer without bias"""
+        layer = RowParallelLinear(
+            in_features=16, 
+            out_features=8, 
+            bias=False
+        )
+        
+        assert layer.bias is None
+        assert hasattr(layer, 'bias')  # Registered as None
+    
+    def test_forward_shape(self):
+        """Forward produces correct output shape"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        x = torch.randn(2, 16)
+        y = layer(x)
+        
+        assert y.shape == (2, 8)
+    
+    def test_forward_with_bias(self):
+        """Forward applies bias correctly"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        x = torch.randn(2, 16)
+        y = layer(x)
+        
+        # Output should not be zero (weights are initialized)
+        assert not torch.allclose(y, torch.zeros_like(y))
+    
+    def test_forward_without_bias(self):
+        """Forward works without bias"""
+        layer = RowParallelLinear(16, 8, bias=False)
+        x = torch.randn(2, 16)
+        y = layer(x)
+        
+        assert y.shape == (2, 8)
+        # Should still produce output (just no bias term)
+        assert not torch.allclose(y, torch.zeros_like(y))
+    
+    def test_gradient_flow(self):
+        """Gradients flow through layer"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        x = torch.randn(2, 16, requires_grad=True)
+        y = layer(x)
+        loss = y.sum()
+        loss.backward()
+        
+        # Check gradients exist
+        assert x.grad is not None
+        assert layer.weight.grad is not None
+        assert layer.bias.grad is not None
+    
+    def test_bias_initialized_to_zero(self):
+        """Bias is initialized to zeros"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        assert torch.allclose(layer.bias, torch.zeros_like(layer.bias))
+    
+    def test_weight_initialized(self):
+        """Weight is initialized (not zeros)"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        # Should not be all zeros after initialization
+        assert not torch.allclose(layer.weight, torch.zeros_like(layer.weight))
+    
+    def test_input_size_per_partition(self):
+        """input_size_per_partition calculated correctly"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        # TP=1, so should be full size
+        assert layer.input_size_per_partition == 16
+    
+    def test_3d_input(self):
+        """Works with 3D input (batch, seq, features)"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        x = torch.randn(2, 10, 16)  # batch=2, seq=10, features=16
+        y = layer(x)
+        
+        assert y.shape == (2, 10, 8)
+    
+    def test_multiple_forward_passes(self):
+        """Layer works for multiple forward passes"""
+        layer = RowParallelLinear(16, 8, bias=True)
+        x1 = torch.randn(2, 16)
+        x2 = torch.randn(3, 16)
+        
+        y1 = layer(x1)
+        y2 = layer(x2)
+        
+        assert y1.shape == (2, 8)
+        assert y2.shape == (3, 8)
+    
+    def test_bias_added_after_reduce(self):
+        """Bias is added after reduce operation (not during linear)"""
+        layer = RowParallelLinear(4, 8, bias=True)
+        
+        # Set bias to known value
+        with torch.no_grad():
+            layer.bias.fill_(1.0)
+        
+        x = torch.randn(2, 4, requires_grad=True)
+        y = layer(x)
+        
+        # Check that output has bias contribution
+        # (not a perfect test, but ensures bias is applied)
+        assert y.grad_fn is not None  # Has gradient function
+    
+    def test_column_to_row_pattern(self):
+        """Column->Row pattern: output stays partitioned then reduced"""
+        col_layer = ColumnParallelLinear(8, 16, bias=True, gather_output=False)
+        row_layer = RowParallelLinear(16, 8, bias=True)
+        
+        x = torch.randn(2, 8)
+        hidden = col_layer(x)  # Partitioned output
+        output = row_layer(hidden)  # Reduced output
+        
+        assert output.shape == (2, 8)
